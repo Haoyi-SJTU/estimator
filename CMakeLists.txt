@@ -3,6 +3,9 @@ project(estimator)
 
 add_compile_options(-std=c++11)
 
+include(./FindGUROBI.cmake)
+include_directories(${GUROBI_INCLUDE_DIRS})
+
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
@@ -42,10 +45,10 @@ include_directories(
 )
 
 ADD_EXECUTABLE(estimator src/estimator.cpp)
-TARGET_LINK_LIBRARIES(estimator ${catkin_LIBRARIES})
+TARGET_LINK_LIBRARIES(estimator ${catkin_LIBRARIES} ${GUROBI_LIBRARIES})
 
-# ADD_EXECUTABLE(translate_xsens_msg src/translate_xsens_msg.cpp)
-# TARGET_LINK_LIBRARIES(translate_xsens_msg ${catkin_LIBRARIES})
+ADD_EXECUTABLE(mip src/mip.cpp)
+TARGET_LINK_LIBRARIES(mip ${catkin_LIBRARIES} ${GUROBI_LIBRARIES})
 
 # TARGET_LINK_LIBRARIES(imu_listener ${catkin_LIBRARIES} ${PROJECT_SOURCE_DIR}/src/libs/libjakaAPI.so)
 ADD_DEPENDENCIES(estimator ${${PROJECT_NAME}_EXPORTED_TARGETS})
