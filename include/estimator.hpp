@@ -25,13 +25,14 @@
 #include <algorithm>
 
 const unsigned int WINDOW_SIZE = 10;   // 滑动窗长度
-const float MAX_delta_depth_1 = 200;   // 深度预积分阈值
-const float MAX_delta_depth_2 = 200;   // 深度预积分阈值
-const float MAX_Ps_for_1_image = 0.05; // 能让图像成为关键帧的最小IMU积分阈值 0.05 m
+const float MIN_delta_depth_1 = 200;   // 深度预积分阈值
+const float MIN_delta_depth_2 = 200;   // 深度预积分阈值
+const float MIN_Ps_for_1_image = 0.05; // 能让图像成为关键帧的最小IMU积分阈值 0.05 m
 const float Max_Ps = 0.05;			   // 一个窗内的最大位移 单位m
 const float Max_Delta_Ps = 0.01;	   // 相邻两个窗的最大位移差值 单位m
 const float Max_Vs = 5;				   // 每帧的最大速度 单位m/s
 const float Max_Delta_Vs = 1;		   // 相邻两帧的最大速度差值 单位m/s
+const float MIN_Active_Feature = 4;	   // 活跃特征点个数的最小阈值，小于4则不进行重投影误差计算
 
 class estimator
 {
@@ -88,14 +89,15 @@ private:
 	bool refresh(Eigen::Vector3d Ps = Eigen::Vector3d::Zero(), Eigen::Matrix3d Rs = Eigen::Matrix3d::Identity()); // 重置估计器
 	bool pointcloud_initial(const std::map<int, Eigen::Matrix<double, 7, 1>> &, double, double, double, double);  // 初始化3D点云
 
-	void filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &, double, double, double, double, std::vector<int> &);
+	bool filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &, double, double, double, double, std::vector<int> &);
 	bool add_keyframe(std::map<int, Eigen::Matrix<double, 7, 1>> &); // 向滑动窗添加关键帧
 	bool find_Active_feature_id();									 // 获取滑动窗内所有特征点编号的交集，作为在整个滑动窗都活跃的特征点
 
 	// 优化器相关函数
-	void add_Variables();				 // 添加优化变量
-	void add_Constraints();				 // 添加约束条件
-	bool calculate_reprojection_error(); // 计算重投影误差，加入优化器目标函数
+	void add_Variables();						// 添加优化变量
+	void add_Constraints();						// 添加约束条件
+	bool calculate_reprojection_error();		// cam残差: 将重投影误差加入目标函数
+	GRBQuadExpr robust_kernel(Eigen::Vector3d, int); // 鲁棒核函数 用于加权cam残差
 
 	void acc_callback(const geometry_msgs::Vector3Stamped::ConstPtr &msg);
 	void gyr_callback(const geometry_msgs::QuaternionStamped::ConstPtr &msg);

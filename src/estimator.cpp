@@ -143,6 +143,7 @@ void estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &fea
     {
       // ROS_INFO("estimator: optimization stage");
       // 这里放优化器
+      calculate_reprojection_error();
     }
     else // 初始化阶段
     {
@@ -156,18 +157,45 @@ void estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &fea
 // 计算重投影误差，加入优化器目标函数
 bool estimator::calculate_reprojection_error()
 {
-
+  std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
+  if (Active_feature_id.size() < MIN_Active_Feature) // 若小于4则不进行重投影误差计算
+    return 0;
+  for (int i = 0; i < WINDOW_SIZE - 1; i++)
+  {
+    // 找出所有活跃点的三维坐标，变换到下一帧的坐标系上
+    for (const auto &id : Active_feature_id)
+    {
+      if (img_queue[i].find(id) != img_queue[i].end() && img_queue[i + 1].find(id) != img_queue[i + 1].end()) // 对于前帧的每一个活跃特征点
+      {
+        // 前后两帧归一化后的特征点坐标之差值
+        Eigen::Vector3d delta_feature = img_queue[i + 1][id].head<3>() / img_queue[i + 1][id].head<3>().norm() -
+                                        img_queue[i][id].head<3>() / img_queue[i][id].head<3>().norm();
+        obj += robust_kernel(delta_feature, i); // 变换后的特征点坐标与后帧对应特征点之间的重投影误差
+      }
+    }
+  }
   return 1;
+}
+
+// 鲁棒核函数 用于加权cam残差
+GRBQuadExpr estimator::robust_kernel(Eigen::Vector3d delta_feature, int i)
+{
+  if (delta_feature.norm() > 10) // 如果误差过大则返回一范数
+    return 0.5 * (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[i] - Ps_queue[i][0]) +
+           0.5 * (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[i] - Ps_queue[i][1]) +
+           0.5 * (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[i] - Ps_queue[i][2]);
+  else // 重投影误差的二范数
+    return (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[i] - Ps_queue[i][0]) +
+           (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[i] - Ps_queue[i][1]) +
+           (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[i] - Ps_queue[i][2]);
 }
 
 // 获取滑动窗内所有特征点编号的交集，作为在整个滑动窗都活跃的特征点
 bool estimator::find_Active_feature_id()
 {
-  // const std::deque<std::map<int, Eigen::Matrix<double, 7, 1>>> &recentSets
-  if (img_queue.size() < WINDOW_SIZE) // 若滑动窗不满
+  if (!WINDOW_FULL_FLAG) // 若滑动窗不满
     return 0;
   std::unordered_map<int, int> intersection;
-  // int queueSize = img_queue.size();
   // 统计每个整数的出现次数
   for (const auto &set : img_queue)
   {
@@ -187,6 +215,7 @@ bool estimator::find_Active_feature_id()
     if (pair.second == WINDOW_SIZE)
       result.push_back(pair.first);
   }
+  std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
   return 1;
 }
 
@@ -201,7 +230,7 @@ void publishPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr &pointCloud, ro
 }
 
 // 判断特征点的图像坐标是否很靠近已知深度值的像素点
-void estimator::filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &image,
+bool estimator::filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &image,
                             double lower_bound_1, double upper_bound_1,
                             double lower_bound_2, double upper_bound_2, std::vector<int> &result)
 {
@@ -215,7 +244,13 @@ void estimator::filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &im
                   bool condition_2 = (vec[4] > lower_bound_2 && vec[4] < upper_bound_2) ? 1 : 0; // 检查第五个元素是否在区间内
                   if (condition_1 && condition_2)
                     result.push_back(pair.first); });
-  return;
+  if (!result.empty())
+    return 1;
+  else
+  {
+    ROS_WARN("Cannot find features near tag");
+    return 0;
+  }
 }
 
 // tag回调函数调用，取出tag附近的2d特征点，形成初始点云
@@ -225,34 +260,35 @@ bool estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double, 7, 
 {
   // tag回调函数调用，取出tag附近的2d特征点，形成初始点云
   std::vector<int> pointIds;
-  filterImage(image, lower_bound_1, upper_bound_1, lower_bound_2, upper_bound_2, pointIds);
-
   pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud(new pcl::PointCloud<pcl::PointXYZ>);
-
-#pragma omp parallel for // 并行处理区：for循环
-  for (const int &id : pointIds)
+  if (filterImage(image, lower_bound_1, upper_bound_1, lower_bound_2, upper_bound_2, pointIds))
   {
-    // 查找编号为 pointIds[i] 的点坐标
-    auto it = image.find(id);
-    if (it != image.end())
+#pragma omp parallel for           // 并行处理区：for循环
+    for (const int &id : pointIds) // 查找编号为 pointIds[i] 的点坐标
     {
-      Eigen::Matrix<double, 7, 1> point = it->second; // 将点坐标加入到 pointCloud 中
-#pragma omp critical                                  // 临界区:区域内的代码同一时间只能被一个线程执行
+      auto it = image.find(id);
+      if (it != image.end())
       {
-        pointCloud->push_back(pcl::PointXYZ(point(0) / 10, point(1) / 10, point(2) / 10));
+        Eigen::Matrix<double, 7, 1> point = it->second; // 将点坐标加入到 pointCloud 中
+#pragma omp critical                                    // 临界区:区域内的代码同一时间只能被一个线程执行
+        {
+          pointCloud->push_back(pcl::PointXYZ(point(0) / 10, point(1) / 10, point(2) / 10));
+        }
       }
     }
+    Eigen::Matrix4d T_cam2world = T_now.inverse();
+    pcl::PointCloud<pcl::PointXYZ>::Ptr transformedCloudB(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::transformPointCloud(*pointCloud, *transformedCloudB, T_cam2world);
+    *pointCloud_world += *transformedCloudB; // 世界系（tag系）下的点云
+    // *pointCloud_world += *pointCloud; // cam1系下的点云
+    publishPointCloud(pointCloud, nh_tag, result_pub);
+    std::cout << "点云的点数是 pointCloud " << pointCloud->size() << std::endl;
+    for (const auto &point : pointCloud->points)
+      // std::cout << "point(" << point.x << ", " << point.y << ", " << point.z << ")" << std::endl;
+      return 1;
   }
-  Eigen::Matrix4d T_cam2world = T_now.inverse();
-  pcl::PointCloud<pcl::PointXYZ>::Ptr transformedCloudB(new pcl::PointCloud<pcl::PointXYZ>);
-  pcl::transformPointCloud(*pointCloud, *transformedCloudB, T_cam2world);
-  *pointCloud_world += *transformedCloudB; // cam1系下的点云
-  // *pointCloud_world += *pointCloud;//世界系（tag系）下的点云
-  publishPointCloud(pointCloud, nh_tag, result_pub);
-  std::cout << "点云的点数是 pointCloud " << pointCloud->size() << std::endl;
-  for (const auto &point : pointCloud->points)
-    std::cout << "point(" << point.x << ", " << point.y << ", " << point.z << ")" << std::endl;
-  return 1;
+  else
+    return 0;
 }
 
 void estimator::apriltag_callback_cam1(const apriltag_ros::AprilTagDetectionArray::ConstPtr &msg)
@@ -309,9 +345,9 @@ void estimator::laser_callback(const geometry_msgs::PointStamped::ConstPtr &msg)
   float laser_time = msg->header.stamp.toSec();
   float delta_depth_1 = msg->point.x;
   float delta_depth_2 = msg->point.y;
-  if (delta_depth_1 > MAX_delta_depth_1)
+  if (delta_depth_1 > MIN_delta_depth_1)
   {
-    if (delta_depth_2 > MAX_delta_depth_2) // 双深度预积分均达到阈值
+    if (delta_depth_2 > MIN_delta_depth_2) // 双深度预积分均达到阈值
     {
       ;
     }
@@ -360,13 +396,13 @@ void estimator::pre_integrate()
 // 图像关键帧进窗img_queue,并获取滑动窗内所有特征点编号的交集
 bool estimator::add_keyframe(std::map<int, Eigen::Matrix<double, 7, 1>> &image)
 {
-  bool imu_flag = ((Ps_now[0] > MAX_Ps_for_1_image) || (Ps_now[1] > MAX_Ps_for_1_image) || (Ps_now[2] > MAX_Ps_for_1_image) ? 1 : 0); // 如果IMU的任意一轴位置积分值超过0.05m
+  bool imu_flag = ((Ps_now[0] > MIN_Ps_for_1_image) || (Ps_now[1] > MIN_Ps_for_1_image) || (Ps_now[2] > MIN_Ps_for_1_image) ? 1 : 0); // 如果IMU的任意一轴位置积分值超过0.05m
   // bool gyr_flag = //如果IMU的任意一轴转角积分值超过
   // bool laser_flag =
   if (imu_flag || !ESTIMATOR_FLAG) // 如果符合关键帧条件之一:1 IMU积分条件 2 激光测距条件 3 还没有进行初始化
   {
     img_queue.push_back(image);
-    if (!find_Active_feature_id())//获取滑动窗内所有特征点编号的交集
+    if (!find_Active_feature_id()) // 获取滑动窗内所有特征点编号的交集
       ROS_WARN("haven`t find Active feature id! Ignore it in Initial mode");
     return 1;
   }
