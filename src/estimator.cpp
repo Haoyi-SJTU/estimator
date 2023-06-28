@@ -157,7 +157,7 @@ void estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &fea
 // 计算重投影误差，加入优化器目标函数
 bool estimator::calculate_reprojection_error()
 {
-  std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
+  // std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
   if (Active_feature_id.size() < MIN_Active_Feature) // 若小于4则不进行重投影误差计算
     return 0;
   for (int i = 0; i < WINDOW_SIZE - 1; i++)
@@ -215,7 +215,7 @@ bool estimator::find_Active_feature_id()
     if (pair.second == WINDOW_SIZE)
       result.push_back(pair.first);
   }
-  std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
+  // std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
   return 1;
 }
 
@@ -282,7 +282,7 @@ bool estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double, 7, 
     *pointCloud_world += *transformedCloudB; // 世界系（tag系）下的点云
     // *pointCloud_world += *pointCloud; // cam1系下的点云
     publishPointCloud(pointCloud, nh_tag, result_pub);
-    std::cout << "点云的点数是 pointCloud " << pointCloud->size() << std::endl;
+    // std::cout << "点云的点数是 pointCloud " << pointCloud->size() << std::endl;
     for (const auto &point : pointCloud->points)
       // std::cout << "point(" << point.x << ", " << point.y << ", " << point.z << ")" << std::endl;
       return 1;
@@ -293,10 +293,11 @@ bool estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double, 7, 
 
 void estimator::apriltag_callback_cam1(const apriltag_ros::AprilTagDetectionArray::ConstPtr &msg)
 {
+  if (msg->detections.empty())
+    return;
   const std_msgs::Header &Header = msg->header;
   const std::vector<apriltag_ros::AprilTagDetection> detections = msg->detections; // 接收 AprilTagDetection[] 类型的 detections
-  int num_detections = detections.size();                                          // 获取 detections 数组的大小
-  std::vector<int32_t> ids;                                                        // 存储 id 和 pose
+  int num_detections = detections.size();                                          // 获取 detections 数组的大小                                                       // 存储 id 和 pose
   geometry_msgs::PoseWithCovarianceStamped pose_temp;
   Eigen::Quaterniond q_cam_tag; // tag在cam1系下的四元数
   Eigen::Vector3d t_cam_tag;    // tag在cam1系下的平移向量
@@ -304,8 +305,6 @@ void estimator::apriltag_callback_cam1(const apriltag_ros::AprilTagDetectionArra
   for (int i = 0; i < num_detections; i++) // 处理 detections 数据
   {
     pose_temp = detections[i].pose;
-    if (ids.empty())
-      return;
     t_cam_tag << pose_temp.pose.pose.position.x, pose_temp.pose.pose.position.y, pose_temp.pose.pose.position.z;
     q_cam_tag.coeffs() << pose_temp.pose.pose.orientation.w, pose_temp.pose.pose.orientation.x, pose_temp.pose.pose.orientation.y, pose_temp.pose.pose.orientation.z;
   }
