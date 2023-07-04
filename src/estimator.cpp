@@ -79,10 +79,10 @@ void estimator::gyr_callback(const geometry_msgs::QuaternionStamped::ConstPtr &m
 void estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &feature_msg) //
 {
   // 封装单帧图像 得到image图像消息的全部内容
-  map<int, Eigen::Matrix<double, 7, 1>> image; // 存放最新图像消息特征点的 编号int、特征点信息Matrix
+  map<int, Eigen::Matrix<double, 8, 1>> image; // 存放最新图像消息特征点的 编号int、特征点信息Matrix
   int feature_id;
-  double x, y, z, p_u, p_v, velocity_x, velocity_y;
-  Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
+  double x, y, z, p_u, p_v, velocity_x, velocity_y, which_cam;
+  Eigen::Matrix<double, 8, 1> xyz_uv_velocity;
   if (feature_msg->points.size() <= 3)
     return;
   for (unsigned int i = 0; i < feature_msg->points.size(); i++)
@@ -96,7 +96,8 @@ void estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &fea
     p_v = feature_msg->channels[2].values[i];
     velocity_x = feature_msg->channels[3].values[i];
     velocity_y = feature_msg->channels[4].values[i];
-    xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y; // 单个特征点的坐标、速度存入xyz_uv_velocity
+    which_cam = feature_msg->channels[5].values[i];
+    xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y, which_cam; // 单个特征点的坐标、速度存入xyz_uv_velocity
     // image存放一张图的所有特征点信息
     image.emplace(feature_id, xyz_uv_velocity); // 一个feature_id对应一个xyz_uv_velocity
   }
@@ -107,43 +108,58 @@ void estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &fea
   {
     WINDOW_FULL_FLAG = 0;
     if (!add_keyframe(image)) // 图像关键帧进窗img_queue,并获取滑动窗内所有特征点编号的交集
-      return;
+      return;                 // 如果符合关键帧条件，则存入滑动窗，否则退出
     // 读预积分结果、清空预积分
     pthread_mutex_lock(&mutex);   // 加锁 取出预积分结果
     Ps_queue.push_back(Ps_now);   // 位置预积分进窗
     Vs_queue.push_back(Vs_now);   // 速度预积分进窗
-    Rs_queue.push_back(Rs_now);   // 转角预积分进窗
+    Rs_queue.push_back(Rs_now);   // 转角旋转矩阵预积分进窗
+    Qs_queue.push_back(Qs_now);   // 转角四元数预积分进窗
     pthread_mutex_unlock(&mutex); // 解锁 结束取预积分结果
     Ps_now.setZero();             // 新一轮预积分，位移置零，速度不变。但是VINS里直接把速度置零了
     Rs_now.setZero();
+    Qs_now.setIdentity();
   }
   else // 滑动窗已满
   {
     WINDOW_FULL_FLAG = 1;
-    if (!add_keyframe(image)) // 如果符合关键帧条件，则存入滑动窗，否则退出
-      return;
+    if (!add_keyframe(image)) // 图像关键帧进窗img_queue,并获取滑动窗内所有特征点编号的交集
+      return;                 // 如果符合关键帧条件，则存入滑动窗，否则退出
     // 读预积分结果、清空预积分
     pthread_mutex_lock(&mutex);   // 加锁 取出预积分结果
     Ps_queue.push_back(Ps_now);   // 位置预积分进窗
     Vs_queue.push_back(Vs_now);   // 速度预积分进窗
-    Rs_queue.push_back(Rs_now);   // 转角预积分进窗
+    Rs_queue.push_back(Rs_now);   // 转角旋转矩阵预积分进窗
+    Qs_queue.push_back(Qs_now);   // 转角四元数预积分进窗
     pthread_mutex_unlock(&mutex); // 解锁 结束取预积分结果
     Ps_now.setZero();             // 新一轮预积分，位移置零，速度不变。但是VINS里直接把速度置零了
     Rs_now.setZero();
+    Qs_now.setIdentity();
     // 滑动窗已满 需要清理掉最早的数据 对应VINS slidWindow()
     img_queue.pop_front();
     Ps_queue.pop_front();
     Vs_queue.pop_front();
     Rs_queue.pop_front();
+    Qs_queue.pop_front();
   }
 
   if (WINDOW_FULL_FLAG)
   {
     if (ESTIMATOR_FLAG) // 已完成初始化 进入优化阶段
     {
-      // ROS_INFO("estimator: optimization stage");
       // 这里放优化器
       calculate_reprojection_error();
+      calculate_preintegrate_error();//单独运行无误
+      try
+      {
+        model.setObjective(obj);
+        model.optimize();
+      }
+      catch (GRBException &ex)
+      {
+        cout << "Error code =" << ex.getErrorCode() << endl;
+        cout << ex.getMessage() << endl;
+      }
     }
     else // 初始化阶段
     {
@@ -154,12 +170,45 @@ void estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &fea
   }
 }
 
+// 计算预积分误差，加入优化器目标函数
+bool estimator::calculate_preintegrate_error()
+{
+  if (Active_feature_id.size() < MIN_Active_Feature) // 若小于4则不进行重投影误差计算
+    return 0;
+  // 位移
+  for (int i = 0; i < WINDOW_SIZE - 1; i++)
+  {
+    obj += (Ps_queue[i][0] - position[3 * i]) * (Ps_queue[i][0] - position[3 * i]) +
+           (Ps_queue[i][1] - position[3 * i + 1]) * (Ps_queue[i][1] - position[3 * i + 1]) +
+           (Ps_queue[i][2] - position[3 * i + 2]) * (Ps_queue[i][2] - position[3 * i + 2]);
+  }
+  // 速度
+  for (int i = 0; i < WINDOW_SIZE - 1; i++)
+  {
+    obj += (Vs_queue[i][0] - velocity[3 * i]) * (Vs_queue[i][0] - velocity[3 * i]) +
+           (Vs_queue[i][1] - velocity[3 * i + 1]) * (Vs_queue[i][1] - velocity[3 * i + 1]) +
+           (Vs_queue[i][2] - velocity[3 * i + 2]) * (Vs_queue[i][2] - velocity[3 * i + 2]);
+  }
+
+  // 转角
+  for (int i = 0; i < WINDOW_SIZE - 1; i++)
+  {
+    obj += (Qs_queue[i].w() - quaternion[4 * i]) * (Qs_queue[i].w() - quaternion[4 * i]) +
+           (Qs_queue[i].x() - quaternion[4 * i + 1]) * (Qs_queue[i].x() - quaternion[4 * i + 1]) +
+           (Qs_queue[i].y() - quaternion[4 * i + 2]) * (Qs_queue[i].y() - quaternion[4 * i + 2]) +
+           (Qs_queue[i].z() - quaternion[4 * i + 3]) * (Qs_queue[i].z() - quaternion[4 * i + 3]);
+  }
+  return 1;
+}
+
 // 计算重投影误差，加入优化器目标函数
 bool estimator::calculate_reprojection_error()
 {
-  // std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
+  // ROS_INFO("cal_reproject Active id.size() = : %ld", Active_feature_id.size());
   if (Active_feature_id.size() < MIN_Active_Feature) // 若小于4则不进行重投影误差计算
     return 0;
+  scale[2 * WINDOW_SIZE - 2].set(GRB_DoubleAttr_Obj, scale_factor_1);
+  scale[2 * WINDOW_SIZE - 1].set(GRB_DoubleAttr_Obj, scale_factor_2);
   for (int i = 0; i < WINDOW_SIZE - 1; i++)
   {
     // 找出所有活跃点的三维坐标，变换到下一帧的坐标系上
@@ -170,7 +219,10 @@ bool estimator::calculate_reprojection_error()
         // 前后两帧归一化后的特征点坐标之差值
         Eigen::Vector3d delta_feature = img_queue[i + 1][id].head<3>() / img_queue[i + 1][id].head<3>().norm() -
                                         img_queue[i][id].head<3>() / img_queue[i][id].head<3>().norm();
-        obj += robust_kernel(delta_feature, i); // 变换后的特征点坐标与后帧对应特征点之间的重投影误差
+        double which_cam = img_queue[i][id][7];
+        pthread_mutex_lock(&mutex);
+        obj += robust_kernel(delta_feature, i, which_cam); // 变换后的特征点坐标与后帧对应特征点之间的重投影误差
+        pthread_mutex_unlock(&mutex);
       }
     }
   }
@@ -178,25 +230,41 @@ bool estimator::calculate_reprojection_error()
 }
 
 // 鲁棒核函数 用于加权cam残差
-GRBQuadExpr estimator::robust_kernel(Eigen::Vector3d delta_feature, int i)
+GRBQuadExpr estimator::robust_kernel(Eigen::Vector3d delta_feature, int i, double which_cam)
 {
-  if (delta_feature.norm() > 10) // 如果误差过大则返回一范数
-    return 0.5 * (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[i] - Ps_queue[i][0]) +
-           0.5 * (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[i] - Ps_queue[i][1]) +
-           0.5 * (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[i] - Ps_queue[i][2]);
-  else // 重投影误差的二范数
-    return (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[i] - Ps_queue[i][0]) +
-           (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[i] - Ps_queue[i][1]) +
-           (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[i] - Ps_queue[i][2]);
+  if (which_cam == 1)
+  {
+    if (delta_feature.norm() > 10) // 如果误差过大则返回一范数
+      return 0.5 * (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[2 * i] - Ps_queue[i][0]) +
+             0.5 * (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[2 * i] - Ps_queue[i][1]) +
+             0.5 * (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[2 * i] - Ps_queue[i][2]);
+    else // 重投影误差的二范数
+      return (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[2 * i] - Ps_queue[i][0]) +
+             (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[2 * i] - Ps_queue[i][1]) +
+             (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[2 * i] - Ps_queue[i][2]);
+  }
+  else
+  {
+    if (delta_feature.norm() > 10) // 如果误差过大则返回一范数
+      return 0.5 * (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[2 * i + 1] - Ps_queue[i][0]) +
+             0.5 * (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[2 * i] - Ps_queue[i][1]) +
+             0.5 * (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[2 * i] - Ps_queue[i][2]);
+    else // 重投影误差的二范数
+      return (delta_feature[0] * scale[i] - Ps_queue[i][0]) * (delta_feature[0] * scale[2 * i + 1] - Ps_queue[i][0]) +
+             (delta_feature[1] * scale[i] - Ps_queue[i][1]) * (delta_feature[1] * scale[2 * i + 1] - Ps_queue[i][1]) +
+             (delta_feature[2] * scale[i] - Ps_queue[i][2]) * (delta_feature[2] * scale[2 * i + 1] - Ps_queue[i][2]);
+  }
 }
 
 // 获取滑动窗内所有特征点编号的交集，作为在整个滑动窗都活跃的特征点
 bool estimator::find_Active_feature_id()
 {
+  // ROS_INFO("Active feature id.size() before= %ld", Active_feature_id.size());
   if (!WINDOW_FULL_FLAG) // 若滑动窗不满
     return 0;
   std::unordered_map<int, int> intersection;
-  // 统计每个整数的出现次数
+  Active_feature_id.clear();
+  // 统计整数出现的次数
   for (const auto &set : img_queue)
   {
     for (const auto &pair : set)
@@ -209,13 +277,12 @@ bool estimator::find_Active_feature_id()
     }
   }
   // 找出出现次数等于队列长度的整数，将其添加到结果集合中
-  std::vector<int> result;
   for (const auto &pair : intersection)
   {
     if (pair.second == WINDOW_SIZE)
-      result.push_back(pair.first);
+      Active_feature_id.push_back(pair.first);
   }
-  // std::cout << "Active_feature_id.size() = " << Active_feature_id.size() << std::endl;
+  // ROS_INFO("Active feature id.size() after= %ld", Active_feature_id.size());
   return 1;
 }
 
@@ -230,16 +297,16 @@ void publishPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr &pointCloud, ro
 }
 
 // 判断特征点的图像坐标是否很靠近已知深度值的像素点
-bool estimator::filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &image,
+bool estimator::filterImage(const std::map<int, Eigen::Matrix<double, 8, 1>> &image,
                             double lower_bound_1, double upper_bound_1,
                             double lower_bound_2, double upper_bound_2, std::vector<int> &result)
 {
   // 筛选出符合条件的编号
-  // 7维向量的内容: x, y, z, p_u, p_v, velocity_x, velocity_y
-  std::for_each(image.begin(), image.end(), [&](const std::pair<int, Eigen::Matrix<double, 7, 1>> &pair) -> void
+  // 8维向量的内容: x, y, z, p_u, p_v, velocity_x, velocity_y, which_Cam
+  std::for_each(image.begin(), image.end(), [&](const std::pair<int, Eigen::Matrix<double, 8, 1>> &pair) -> void
                 {
                   // 存在问题：两张图片的数据已经合并在一起了，cam2的数据也会进来，需要再判断一下xyz坐标，筛选出cam1的点
-                  const Eigen::Matrix<double, 7, 1> &vec = pair.second;
+                  const Eigen::Matrix<double, 8, 1> &vec = pair.second;
                   bool condition_1 = (vec[3] > lower_bound_1 && vec[3] < upper_bound_1) ? 1 : 0; // 检查第四个元素是否在区间内
                   bool condition_2 = (vec[4] > lower_bound_2 && vec[4] < upper_bound_2) ? 1 : 0; // 检查第五个元素是否在区间内
                   if (condition_1 && condition_2)
@@ -254,7 +321,7 @@ bool estimator::filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &im
 }
 
 // tag回调函数调用，取出tag附近的2d特征点，形成初始点云
-bool estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double, 7, 1>> &image,
+bool estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double, 8, 1>> &image,
                                    double lower_bound_1, double upper_bound_1,
                                    double lower_bound_2, double upper_bound_2)
 {
@@ -269,7 +336,7 @@ bool estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double, 7, 
       auto it = image.find(id);
       if (it != image.end())
       {
-        Eigen::Matrix<double, 7, 1> point = it->second; // 将点坐标加入到 pointCloud 中
+        Eigen::Matrix<double, 8, 1> point = it->second; // 将点坐标加入到 pointCloud 中
 #pragma omp critical                                    // 临界区:区域内的代码同一时间只能被一个线程执行
         {
           pointCloud->push_back(pcl::PointXYZ(point(0) / 10, point(1) / 10, point(2) / 10));
@@ -334,30 +401,13 @@ void estimator::tag_center_callback(const geometry_msgs::PointStamped::ConstPtr 
   }
 }
 
+// 激光点深度值测量的回调函数：接收两个cam的尺度因子，作为优化器初值
 void estimator::laser_callback(const geometry_msgs::PointStamped::ConstPtr &msg) // laser 深度差值 回调
 {
-  //  主节点做一个消息回调函数，把VI优化的结果结合这个delta_depth再做优化
-  //  需要做实验确定一下怎么利用两个深度数据计算H矩阵
-  //  双传感器装好后，做实验在尺子上推一下：
-  //  1 得到能够产生稳定H矩阵的最小平移距离
-  //  2 两个相机产生两个H矩阵和两个深度差，什么时候只用一个，什么时候两个都用
-  float laser_time = msg->header.stamp.toSec();
-  float delta_depth_1 = msg->point.x;
-  float delta_depth_2 = msg->point.y;
-  if (delta_depth_1 > MIN_delta_depth_1)
+  if (ESTIMATOR_FLAG) // 只在优化阶段填入scale factor初值
   {
-    if (delta_depth_2 > MIN_delta_depth_2) // 双深度预积分均达到阈值
-    {
-      ;
-    }
-    else // 仅delta_depth_1达到阈值
-    {
-      ;
-    }
-  }
-  else ////仅delta_depth_2达到阈值
-  {
-    ;
+    scale_factor_1 = msg->point.x;
+    scale_factor_1 = msg->point.y;
   }
 }
 
@@ -378,8 +428,8 @@ void estimator::pre_integrate()
   // Rs[img_count] = gyr_now_quatern.toRotationMatrix();// 需要去掉gyr_0的转角!!!
 
   // gyr_0与gyr_now之间的转角差，转换为旋转矩阵存入Rs_now，作为预积分结果存入滑动窗
-  Eigen::Quaterniond q_now = gyr_now.second * gyr_0.second.inverse();
-  Rs_now = q_now.toRotationMatrix();
+  Qs_now = gyr_now.second * gyr_0.second.inverse();
+  Rs_now = Qs_now.toRotationMatrix();
 
   // cout<<Rs[img_count]<<endl<<endl<<endl;
   // Vector3d un_acc_1 = Rs[j] * (linear_acceleration - Bas[img_count]) - g;
@@ -393,7 +443,7 @@ void estimator::pre_integrate()
 }
 
 // 图像关键帧进窗img_queue,并获取滑动窗内所有特征点编号的交集
-bool estimator::add_keyframe(std::map<int, Eigen::Matrix<double, 7, 1>> &image)
+bool estimator::add_keyframe(std::map<int, Eigen::Matrix<double, 8, 1>> &image)
 {
   bool imu_flag = ((Ps_now[0] > MIN_Ps_for_1_image) || (Ps_now[1] > MIN_Ps_for_1_image) || (Ps_now[2] > MIN_Ps_for_1_image) ? 1 : 0); // 如果IMU的任意一轴位置积分值超过0.05m
   // bool gyr_flag = //如果IMU的任意一轴转角积分值超过
@@ -401,8 +451,8 @@ bool estimator::add_keyframe(std::map<int, Eigen::Matrix<double, 7, 1>> &image)
   if (imu_flag || !ESTIMATOR_FLAG) // 如果符合关键帧条件之一:1 IMU积分条件 2 激光测距条件 3 还没有进行初始化
   {
     img_queue.push_back(image);
-    if (!find_Active_feature_id()) // 获取滑动窗内所有特征点编号的交集
-      ROS_WARN("haven`t find Active feature id! Ignore it in Initial mode");
+    if (!find_Active_feature_id() && ESTIMATOR_FLAG) // 获取滑动窗内所有特征点编号的交集
+      ROS_WARN("no Active feature id!");
     return 1;
   }
   else
@@ -416,7 +466,7 @@ void estimator::add_Variables()
   position.resize(3 * WINDOW_SIZE);
   velocity.resize(3 * WINDOW_SIZE);
   quaternion.resize(4 * WINDOW_SIZE);
-  scale.resize(WINDOW_SIZE);
+  scale.resize(2 * WINDOW_SIZE); // 每一帧内两个相机存放两个尺度因子
   for (int i = 0; i < WINDOW_SIZE; i++)
   {
     // 添加位姿变量
@@ -427,13 +477,16 @@ void estimator::add_Variables()
     velocity[3 * i] = model.addVar(-GRB_INFINITY, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
     velocity[3 * i + 1] = model.addVar(-GRB_INFINITY, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
     velocity[3 * i + 2] = model.addVar(-GRB_INFINITY, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
-    // 添加四元数变量
+    // 添加四元数变量 顺序: 实部w, 虚部x,y,z
     quaternion[4 * i] = model.addVar(-1.0, 1.0, 0.0, GRB_CONTINUOUS);
     quaternion[4 * i + 1] = model.addVar(-1.0, 1.0, 0.0, GRB_CONTINUOUS);
     quaternion[4 * i + 2] = model.addVar(-1.0, 1.0, 0.0, GRB_CONTINUOUS);
     quaternion[4 * i + 3] = model.addVar(-1.0, 1.0, 0.0, GRB_CONTINUOUS);
-    // 添加尺度因子变量
-    scale[i] = model.addVar(0, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
+  }
+  // 添加尺度因子变量
+  for (int j = 0; j < 2 * WINDOW_SIZE; j++)
+  {
+    scale[j] = model.addVar(0, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
   }
 }
 
@@ -446,20 +499,20 @@ void estimator::add_Constraints()
     int Q_id = 4 * i; // 四元数下标
     int P_id = 3 * i;
     // 位置约束
-    model.addConstr(position[P_id] <= Max_Ps); // 约束一个窗内的最大位移 <= 0.05m
-    model.addConstr(position[P_id + 1] <= Max_Ps);
-    model.addConstr(position[P_id + 2] <= Max_Ps);
-    model.addConstr(position[P_id + 3] - position[P_id] <= Max_Delta_Ps); // 约束相邻两个窗的最大位移差值 <= 0.01m
-    model.addConstr(position[P_id + 4] - position[P_id + 1] <= Max_Delta_Ps);
-    model.addConstr(position[P_id + 5] - position[P_id + 2] <= Max_Delta_Ps);
-    // // 速度约束
-    model.addConstr(velocity[P_id] <= Max_Vs); // 约束每帧的最大速度 <= 0.05m
-    model.addConstr(velocity[P_id + 1] <= Max_Vs);
-    model.addConstr(velocity[P_id + 2] <= Max_Vs);
-    model.addConstr(velocity[P_id + 3] - velocity[P_id] <= Max_Delta_Vs); // 约束相邻两帧的最大速度差值 <= 0.01m
-    model.addConstr(velocity[P_id + 4] - velocity[P_id + 1] <= Max_Delta_Vs);
-    model.addConstr(velocity[P_id + 5] - velocity[P_id + 2] <= Max_Delta_Vs);
-    // 转角四元数约束
+    model.addConstr(position[P_id] <= Max_Ps, "Max Ps_x in 1 img"); // 约束一个窗内的最大位移 <= 0.05m
+    model.addConstr(position[P_id + 1] <= Max_Ps, "Max Ps_y in 1 img");
+    model.addConstr(position[P_id + 2] <= Max_Ps, "Max Ps_z in 1 img");
+    model.addConstr(position[P_id + 3] - position[P_id] <= Max_Delta_Ps, "Max delta Ps_x in 1 img"); // 约束相邻两个窗的最大位移差值 <= 0.01m
+    model.addConstr(position[P_id + 4] - position[P_id + 1] <= Max_Delta_Ps, "Max delta Ps_y in 1 img");
+    model.addConstr(position[P_id + 5] - position[P_id + 2] <= Max_Delta_Ps, "Max delta Ps_z in 1 img");
+    // 速度约束
+    model.addConstr(velocity[P_id] <= Max_Vs, "Max Vs_x in 1 img"); // 约束每帧的最大速度 <= 0.05m
+    model.addConstr(velocity[P_id + 1] <= Max_Vs, "Max Vs_y in 1 img");
+    model.addConstr(velocity[P_id + 2] <= Max_Vs, "Max Vs_z in 1 img");
+    model.addConstr(velocity[P_id + 3] - velocity[P_id] <= Max_Delta_Vs, "Max delta Vs_x in 1 img"); // 约束相邻两帧的最大速度差值 <= 0.01m
+    model.addConstr(velocity[P_id + 4] - velocity[P_id + 1] <= Max_Delta_Vs, "Max delta Vs_y in 1 img");
+    model.addConstr(velocity[P_id + 5] - velocity[P_id + 2] <= Max_Delta_Vs, "Max delta Vs_z in 1 img");
+    // 转角四元数约束  顺序: 实部w, 虚部x,y,z
     // model.addConstr(quaternion[Q_id] * quaternion[Q_id] + quaternion[Q_id + 1] * quaternion[Q_id + 1] + quaternion[Q_id + 2] * quaternion[Q_id + 2] + quaternion[Q_id+ 3] * quaternion[Q_id+ 3] == 1);
     // model.addConstr(quaternion_[4*i] == quaternion_[4*i + 3] * control_input_[6 * i] - quaternion_[q_idx + 2] * control_input_[6 * i + 1] + quaternion_[q_idx + 1] * control_input_[6 * i + 2]);
     // model.addConstr(quaternion_[4*i+1] == quaternion_[4*i + 2] * control_input_[6 * i] + quaternion_[q_idx + 3] * control_input_[6 * i + 1] - quaternion_[q_idx] * control_input_[6 * i + 2]);
@@ -484,6 +537,8 @@ estimator::estimator() : env(), model(env)
   dt = 0;
   img_count = 0;                                              // 图像计数器，在填满滑动窗时使用
   pointCloud_world.reset(new pcl::PointCloud<pcl::PointXYZ>); // 全局点云
+  scale_factor_1 = 1;                                         // 最新尺度因子初值 cam1
+  scale_factor_2 = 1;                                         // 最新尺度因子初值 cam2
 
   // cam1在imu坐标系下的变换矩阵，外参 需要标定!!!!!!!!!!!!!
   T_imu_cam << 0, 0, 1, 18.1,
@@ -497,6 +552,7 @@ estimator::estimator() : env(), model(env)
   T_now.setIdentity();
 
   // 优化器相关
+  model.set(GRB_StringAttr_ModelName, "LVIO_optimization");
   add_Variables();   // 添加优化变量
   add_Constraints(); // 添加约束
 
