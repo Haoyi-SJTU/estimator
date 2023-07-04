@@ -56,26 +56,30 @@ private:
 	std::pair<double, Eigen::Quaterniond> gyr;	   // 时刻更新的 时间戳+转角
 	float tag_center_u, tag_center_v;			   // tag中心点的图像坐标
 
-	// std::queue<sensor_msgs::PointCloudConstPtr> feature_msg_buf; //图像特征点消息队列
 	Eigen::Vector3d Ps_now;								  // IMU预积分 当前三方向位置
 	Eigen::Vector3d Vs_now;								  // IMU预积分 当前三方向速度
 	Eigen::Matrix3d Rs_now;								  // IMU预积分 当前三方向转角
+	Eigen::Quaterniond Qs_now;
 	pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud_world; // 世界坐标系下的点云
 
+    // tag产生的数据 相对于tag的坐标
 	Eigen::Matrix4d T_imu_cam; // cam1相对于imu坐标系的变换矩阵，外参   注意此参数来自于标定！！！！！！！！！！！！！！
 	Eigen::Vector3d P_now;	   // 当前位置（相对于tag）
 	Eigen::Quaterniond Q_now;  // 当前转角四元数（相对于tag）
 	Eigen::Matrix3d R_now;	   // 当前转角矩阵（相对于tag）
 	Eigen::Matrix4d T_now;	   // 当前齐次变换矩阵（相对于tag）
 
-	std::deque<std::map<int, Eigen::Matrix<double, 7, 1>>> img_queue; // 滑动窗 图像特征点
+	std::deque<std::map<int, Eigen::Matrix<double, 8, 1>>> img_queue; // 滑动窗 图像特征点
 	std::deque<Eigen::Vector3d> Ps_queue;							  // 滑动窗 三方向位置
 	std::deque<Eigen::Vector3d> Vs_queue;							  // 滑动窗 三方向速度
-	std::deque<Eigen::Matrix3d> Rs_queue;							  // 滑动窗 转角四元数
+	std::deque<Eigen::Matrix3d> Rs_queue;							  // 滑动窗 转角旋转矩阵
+	std::deque<Eigen::Quaterniond> Qs_queue;						  // 滑动窗 转角四元数
 	std::deque<Eigen::Vector3d> Bas_queue;
 	std::deque<Eigen::Vector3d> Bgs_queue;
 
 	std::vector<int> Active_feature_id; // 动态更新在整个滑动窗内都活跃的特征点ID
+	float scale_factor_1;				// 最新尺度因子初值 cam1
+	float scale_factor_2;				// 最新尺度因子初值 cam2
 
 	GRBEnv env;						// 优化环境
 	GRBModel model;					// 优化模型
@@ -87,17 +91,18 @@ private:
 
 	void pre_integrate();																						  // 预积分
 	bool refresh(Eigen::Vector3d Ps = Eigen::Vector3d::Zero(), Eigen::Matrix3d Rs = Eigen::Matrix3d::Identity()); // 重置估计器
-	bool pointcloud_initial(const std::map<int, Eigen::Matrix<double, 7, 1>> &, double, double, double, double);  // 初始化3D点云
+	bool pointcloud_initial(const std::map<int, Eigen::Matrix<double, 8, 1>> &, double, double, double, double);  // 初始化3D点云
 
-	bool filterImage(const std::map<int, Eigen::Matrix<double, 7, 1>> &, double, double, double, double, std::vector<int> &);
-	bool add_keyframe(std::map<int, Eigen::Matrix<double, 7, 1>> &); // 向滑动窗添加关键帧
+	bool filterImage(const std::map<int, Eigen::Matrix<double, 8, 1>> &, double, double, double, double, std::vector<int> &);
+	bool add_keyframe(std::map<int, Eigen::Matrix<double, 8, 1>> &); // 向滑动窗添加关键帧
 	bool find_Active_feature_id();									 // 获取滑动窗内所有特征点编号的交集，作为在整个滑动窗都活跃的特征点
 
 	// 优化器相关函数
-	void add_Variables();						// 添加优化变量
-	void add_Constraints();						// 添加约束条件
-	bool calculate_reprojection_error();		// cam残差: 将重投影误差加入目标函数
-	GRBQuadExpr robust_kernel(Eigen::Vector3d, int); // 鲁棒核函数 用于加权cam残差
+	void add_Variables();									 // 添加优化变量
+	void add_Constraints();									 // 添加约束条件
+	bool calculate_reprojection_error();					 // cam残差: 将重投影误差加入目标函数
+	bool calculate_preintegrate_error();					 // 预积分误差: 最小化位移、速度、转角的估计值与IMU预积分之间的差值
+	GRBQuadExpr robust_kernel(Eigen::Vector3d, int, double); // 鲁棒核函数 用于加权cam残差
 
 	void acc_callback(const geometry_msgs::Vector3Stamped::ConstPtr &msg);
 	void gyr_callback(const geometry_msgs::QuaternionStamped::ConstPtr &msg);
