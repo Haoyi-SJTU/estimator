@@ -3,12 +3,16 @@
 #include <iostream>
 #include <cmath>
 #include <vector>
+// ROS
 #include <ros/ros.h>
-
 #include <geometry_msgs/Vector3Stamped.h>
 #include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/PointCloud2.h> //测试发布ROS点云消息用
-// #include <Eigen/Dense>
+// 发布结果消息
+#include "geometry_msgs/Vector3.h"
+#include "geometry_msgs/Quaternion.h"
+#include "estimator/result.h"
+
 #include <eigen3/Eigen/Dense>
 #include <deque>
 // 点云处理
@@ -19,28 +23,33 @@
 #include <pcl_conversions/pcl_conversions.h> //测试发布ROS点云消息用
 // 优化器
 #include "gurobi_c++.h"
-
 // 获取活跃特征点
 #include <unordered_map>
 #include <algorithm>
+
+#define DEBUG_estimator // 优化器调试
 
 const unsigned int WINDOW_SIZE = 10;   // 滑动窗长度
 const float MIN_delta_depth_1 = 200;   // 深度预积分阈值
 const float MIN_delta_depth_2 = 200;   // 深度预积分阈值
 const float MIN_Ps_for_1_image = 0.05; // 能让图像成为关键帧的最小IMU积分阈值 0.05 m
-const float Max_Ps = 0.05;			   // 一个窗内的最大位移 单位m
-const float Max_Delta_Ps = 0.01;	   // 相邻两个窗的最大位移差值 单位m
-const float Max_Vs = 5;				   // 每帧的最大速度 单位m/s
-const float Max_Delta_Vs = 1;		   // 相邻两帧的最大速度差值 单位m/s
-const float MIN_Active_Feature = 4;	   // 活跃特征点个数的最小阈值，小于4则不进行重投影误差计算
+const double Max_Ps = 0.1;			   // 一个窗内的最大位移 单位m
+const double Max_Delta_Ps = 0.01;	   // 相邻两个窗的最大位移差值 单位m
+const double Max_Vs = 3;			   // 每帧的最大速度 单位m/s
+const double Max_Delta_Vs = 1;		   // 相邻两帧的最大速度差值 单位m/s
+const double MIN_Active_Feature = 4;   // 活跃特征点个数的最小阈值，小于4则不进行重投影误差计算
+const double DT_IMG = 0.050;		   // 相邻两帧的时间差，根据图像消息发布频率7Hz估计
+const double TOLERANCE = 0.020;		   // 优化器位移-速度约束的上下公差
 
-class estimator
+class VIO_estimator
 {
 private:
 	pthread_mutex_t mutex;
 	ros::Timer result_pub_timer;				   // 定时器
 	ros::Publisher result_pub;					   // 结果发布
+	ros::Publisher pointcloud_pub;				   // 结果点云发布
 	ros::NodeHandle nh_imu;						   // IMU消息相应句柄
+	ros::NodeHandle nh_gyc;						   // IMU消息相应句柄
 	ros::NodeHandle nh_img;						   // 图像消息响应句柄
 	ros::NodeHandle nh_tag;						   // tag消息、tag中心坐标、激光点达到预积分阈值响应句柄
 	unsigned int img_count;						   // 最新图像在滑动窗里的编号
@@ -56,14 +65,14 @@ private:
 	std::pair<double, Eigen::Quaterniond> gyr;	   // 时刻更新的 时间戳+转角
 	float tag_center_u, tag_center_v;			   // tag中心点的图像坐标
 
-	Eigen::Vector3d Ps_now;								  // IMU预积分 当前三方向位置
-	Eigen::Vector3d Vs_now;								  // IMU预积分 当前三方向速度
-	Eigen::Matrix3d Rs_now;								  // IMU预积分 当前三方向转角
+	Eigen::Vector3d Ps_now; // IMU预积分 当前三方向位置
+	Eigen::Vector3d Vs_now; // IMU预积分 当前三方向速度
+	Eigen::Matrix3d Rs_now; // IMU预积分 当前三方向转角
 	Eigen::Quaterniond Qs_now;
 	pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud_world; // 世界坐标系下的点云
 
-    // tag产生的数据 相对于tag的坐标
-	Eigen::Matrix4d T_imu_cam; // cam1相对于imu坐标系的变换矩阵，外参   注意此参数来自于标定！！！！！！！！！！！！！！
+	// tag产生的数据 相对于tag的坐标
+	Eigen::Matrix4d T_imu_cam; // cam1相对于imu坐标系的变换矩阵，单位m 外参   注意此参数来自于标定！！！！！！！！！！！！！！
 	Eigen::Vector3d P_now;	   // 当前位置（相对于tag）
 	Eigen::Quaterniond Q_now;  // 当前转角四元数（相对于tag）
 	Eigen::Matrix3d R_now;	   // 当前转角矩阵（相对于tag）
@@ -81,28 +90,30 @@ private:
 	float scale_factor_1;				// 最新尺度因子初值 cam1
 	float scale_factor_2;				// 最新尺度因子初值 cam2
 
-	GRBEnv env;						// 优化环境
-	GRBModel model;					// 优化模型
-	GRBQuadExpr obj;				// 定义目标函数
-	std::vector<GRBVar> position;	// 优化变量: 位姿
-	std::vector<GRBVar> velocity;	// 优化变量: 速度
-	std::vector<GRBVar> quaternion; // 优化变量: 四元数
-	std::vector<GRBVar> scale;		// 优化变量: 尺度因子
+	// 优化器变量
+	// GRBEnv env;						// 优化环境
+	// GRBModel model;					// 优化模型
+	// GRBQuadExpr obj;				// 定义目标函数
+	// std::vector<GRBVar> position;	// 优化变量: 位姿
+	// std::vector<GRBVar> velocity;	// 优化变量: 速度
+	// std::vector<GRBVar> quaternion; // 优化变量: 四元数
+	// std::vector<GRBVar> scale;		// 优化变量: 尺度因子
+	// 优化器函数
+	void add_Variables(GRBModel &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);					  // 添加优化变量
+	void add_Constraints(GRBModel &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);				  // 添加约束条件
+	bool initial_optimization_variables(std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);			  // 为优化变量设置初值
+	bool calculate_reprojection_error(GRBQuadExpr &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &); // cam残差: 将重投影误差加入目标函数
+	bool calculate_preintegrate_error(GRBQuadExpr &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);						  // 预积分误差: 最小化位移、速度、转角的估计值与IMU预积分之间的差值
+	inline GRBQuadExpr robust_kernel(const double, GRBVar &, GRBVar &);																			  // 鲁棒核函数 用于加权cam残差
+	bool resize_variables(GRBModel &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);				  // 优化失败后收紧变量范围再次优化
 
-	void pre_integrate();																						  // 预积分
+	inline void pre_integrate();																				  // 预积分
 	bool refresh(Eigen::Vector3d Ps = Eigen::Vector3d::Zero(), Eigen::Matrix3d Rs = Eigen::Matrix3d::Identity()); // 重置估计器
 	bool pointcloud_initial(const std::map<int, Eigen::Matrix<double, 8, 1>> &, double, double, double, double);  // 初始化3D点云
 
 	bool filterImage(const std::map<int, Eigen::Matrix<double, 8, 1>> &, double, double, double, double, std::vector<int> &);
 	bool add_keyframe(std::map<int, Eigen::Matrix<double, 8, 1>> &); // 向滑动窗添加关键帧
 	bool find_Active_feature_id();									 // 获取滑动窗内所有特征点编号的交集，作为在整个滑动窗都活跃的特征点
-
-	// 优化器相关函数
-	void add_Variables();									 // 添加优化变量
-	void add_Constraints();									 // 添加约束条件
-	bool calculate_reprojection_error();					 // cam残差: 将重投影误差加入目标函数
-	bool calculate_preintegrate_error();					 // 预积分误差: 最小化位移、速度、转角的估计值与IMU预积分之间的差值
-	GRBQuadExpr robust_kernel(Eigen::Vector3d, int, double); // 鲁棒核函数 用于加权cam残差
 
 	void acc_callback(const geometry_msgs::Vector3Stamped::ConstPtr &msg);
 	void gyr_callback(const geometry_msgs::QuaternionStamped::ConstPtr &msg);
@@ -111,8 +122,9 @@ private:
 	void tag_center_callback(const geometry_msgs::PointStamped::ConstPtr &msg);				// 接收tag中心的图像坐标
 
 	void laser_callback(const geometry_msgs::PointStamped::ConstPtr &msg); // laser 深度差值 回调
+	void publish_result(int, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);
 
 public:
-	estimator();
-	~estimator();
+	VIO_estimator();
+	~VIO_estimator();
 };
