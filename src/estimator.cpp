@@ -173,8 +173,8 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
       model.set(GRB_IntParam_OutputFlag, 1); // 输出详细信息
 #endif
       model.set(GRB_StringAttr_ModelName, "LVIO_optimization");
-      model.set(GRB_IntParam_NonConvex, 2);                                  // 允许非凸性，可能会导致无法获得全局最优解，因为非凸性问题可能有多个局部最优解
-      model.set(GRB_IntParam_Presolve, 0);                                   // 关闭预求解
+      model.set(GRB_IntParam_NonConvex, 2); // 允许非凸性，可能会导致无法获得全局最优解，因为非凸性问题可能有多个局部最优解
+      // model.set(GRB_IntParam_Presolve, 0);                                   // 关闭预求解
       add_Variables(model, position, velocity, quaternion, scale);           // 添加优化变量
       add_Constraints(model, position, velocity, quaternion, scale);         // 添加约束
       initial_optimization_variables(position, velocity, quaternion, scale); // 初值
@@ -182,10 +182,12 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
       // 目标函数
       calculate_reprojection_error(obj, position, velocity, quaternion, scale);
       // calculate_preintegrate_error(obj, position, velocity, quaternion);
+      calculate_scale_factor_error(obj, scale); // 优化器目标函数: 尺度因子误差
       try
       {
         model.setObjective(obj);
         model.set("TimeLimit", "2.0"); // 最大求解时间
+        GRBConstr *comstrs = 0;        // debug
         while (re_switch && optimize_time <= 1)
         {
           model.update();
@@ -199,7 +201,7 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
           {
           case GRB_INF_OR_UNBD:
             ROS_WARN("Model INF_OR_UNBD, try resolve...");
-            model.set(GRB_IntParam_Presolve, 0);
+            model.set(GRB_IntParam_Presolve, 0); // 关闭预求解
             re_switch = 1;
             break;
           case GRB_INFEASIBLE:
@@ -209,7 +211,19 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
             model.write("/home/yuanzhi/catkin_ws/src/estimator/tmp/infeasible_model.ilp");
             model.write("/home/yuanzhi/catkin_ws/src/estimator/tmp/infeasible_model.mps");
 #endif
+            comstrs = model.getConstrs();
+            for (int i = 0; i < model.get(GRB_IntAttr_NumConstrs); ++i)
+            {
+              if (comstrs[i].get(GRB_IntAttr_IISConstr) == 1)
+              {
+                cout << "delete infisable constrain: " << comstrs[i].get(GRB_StringAttr_ConstrName) << endl;
+                // Remove a single constraint from the model
+                model.remove(comstrs[i]);
+                break;
+              }
+            }
             model.feasRelax(GRB_FEASRELAX_LINEAR, true, false, true); // 松弛变量，最小化松弛变量的一范数
+            model.set(GRB_IntParam_Presolve, 0);                      // 关闭预求解
             re_switch = 1;
             break;
           case GRB_UNBOUNDED:
@@ -224,7 +238,7 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
             break;
           case GRB_OPTIMAL:
             object_function_value = model.get(GRB_DoubleAttr_ObjVal);
-            if (object_function_value <= 0) // 优化错误，代价函数为0
+            if (object_function_value <= 0 || object_function_value >= 1e10) // 优化错误，代价函数为0
             {
 #ifdef DEBUG_estimator
               ROS_WARN("ignore 1 error result");
@@ -361,8 +375,8 @@ bool VIO_estimator::calculate_preintegrate_error(GRBQuadExpr &obj,
                                                  std::vector<GRBVar> &position, std::vector<GRBVar> &velocity,
                                                  std::vector<GRBVar> &quaternion)
 {
-  if (Active_feature_id.size() < MIN_Active_Feature) // 若小于4则不进行重投影误差计算
-    return 0;
+  // if (Active_feature_id.size() < MIN_Active_Feature) // 若小于4则不进行重投影误差计算
+  //   return 0;
   // 位移
   for (int i = 0; i < WINDOW_SIZE; i++)
   {
@@ -370,7 +384,8 @@ bool VIO_estimator::calculate_preintegrate_error(GRBQuadExpr &obj,
     obj +=
         ((10 * Ps_queue[i][0] - position[P_id]) * (10 * Ps_queue[i][0] - position[P_id]) +
          (10 * Ps_queue[i][1] - position[P_id + 1]) * (10 * Ps_queue[i][1] - position[P_id + 1]) +
-         (10 * Ps_queue[i][2] - position[P_id + 2]) * (10 * Ps_queue[i][2] - position[P_id + 2]));
+         (10 * Ps_queue[i][2] - position[P_id + 2]) * (10 * Ps_queue[i][2] - position[P_id + 2])) *
+        P_WEIGHT;
   }
   // 速度
   for (int i = 0; i < WINDOW_SIZE; i++)
@@ -379,19 +394,40 @@ bool VIO_estimator::calculate_preintegrate_error(GRBQuadExpr &obj,
     obj +=
         ((10 * Vs_queue[i][0] - velocity[P_id]) * (10 * Vs_queue[i][0] - velocity[P_id]) +
          (10 * Vs_queue[i][1] - velocity[P_id + 1]) * (10 * Vs_queue[i][1] - velocity[P_id + 1]) +
-         (10 * Vs_queue[i][2] - velocity[P_id + 2]) * (10 * Vs_queue[i][2] - velocity[P_id + 2]));
+         (10 * Vs_queue[i][2] - velocity[P_id + 2]) * (10 * Vs_queue[i][2] - velocity[P_id + 2])) *
+        V_WEIGHT;
   }
 
   // 转角
   for (int i = 0; i < WINDOW_SIZE; i++)
   {
     int Q_id = 4 * i; // 四元数下标
-    obj += 100 *
-           ((Qs_queue[i].w() - quaternion[Q_id]) * (Qs_queue[i].w() - quaternion[Q_id]) +
-            (Qs_queue[i].x() - quaternion[Q_id + 1]) * (Qs_queue[i].x() - quaternion[Q_id + 1]) +
-            (Qs_queue[i].y() - quaternion[Q_id + 2]) * (Qs_queue[i].y() - quaternion[Q_id + 2]) +
-            (Qs_queue[i].z() - quaternion[Q_id + 3]) * (Qs_queue[i].z() - quaternion[Q_id + 3]));
+    obj +=
+        ((Qs_queue[i].w() - quaternion[Q_id]) * (Qs_queue[i].w() - quaternion[Q_id]) +
+         (Qs_queue[i].x() - quaternion[Q_id + 1]) * (Qs_queue[i].x() - quaternion[Q_id + 1]) +
+         (Qs_queue[i].y() - quaternion[Q_id + 2]) * (Qs_queue[i].y() - quaternion[Q_id + 2]) +
+         (Qs_queue[i].z() - quaternion[Q_id + 3]) * (Qs_queue[i].z() - quaternion[Q_id + 3])) *
+        Q_WEIGHT;
   }
+  return 1;
+}
+
+// 优化器目标函数: 尺度因子误差
+bool VIO_estimator::calculate_scale_factor_error(GRBQuadExpr &obj, std::vector<GRBVar> &scale)
+{
+  int i;
+  for (i = 0; i < WINDOW_SIZE - 1; i++)
+  {
+    int S_id = 2 * i; // 尺度因子下标
+    obj +=
+        ((scale_factor_1 - scale[S_id]) * (scale_factor_1 - scale[S_id]) +
+         (scale_factor_2 - scale[S_id + 1]) * (scale_factor_2 - scale[S_id + 1])) *
+        SCALE_WEIGHT;
+  }
+  obj +=
+      ((scale_factor_1 - scale[2 * i]) * (scale_factor_1 - scale[2 * i]) +
+       (scale_factor_2 - scale[2 * i + 1]) * (scale_factor_2 - scale[2 * i + 1])) *
+      SCALE_WEIGHT * 2;
   return 1;
 }
 
@@ -400,16 +436,18 @@ bool VIO_estimator::calculate_reprojection_error(GRBQuadExpr &obj,
                                                  std::vector<GRBVar> &position, std::vector<GRBVar> &velocity,
                                                  std::vector<GRBVar> &quaternion, std::vector<GRBVar> &scale)
 {
-  ROS_INFO("cal_reproject Active id.size() = : %ld", Active_feature_id.size());
   if (Active_feature_id.size() < MIN_Active_Feature) // 若小于4则不进行重投影误差计算
     return 0;
-
   // xyz_uv_velocity矩阵包含：x, y, z, p_u, p_v, velocity_x, velocity_y, which_cam
   // image包含：feature_id, xyz_uv_velocity
+  float velocity_x, velocity_y, velocity_z;                     // 每一帧之归一化速度
+  float velocity_x_1, velocity_y_1, velocity_x_2, velocity_y_2; // 每一帧之归一化速度
+  unsigned int cam1_counter, cam2_counter;
+  // Eigen::Vector3d sum_delta_feature; // debug
   for (int i = 0; i < WINDOW_SIZE - 1; i++)
   {
     int P_id = 3 * i;
-    Eigen::Vector3d sum_delta_feature;
+    int S_id = 2 * i; // 尺度因子下标
     // 遍历滑动窗内的所有帧
     // 找出所有活跃点的三维坐标，变换到下一帧的坐标系上
     for (const auto &id : Active_feature_id)
@@ -419,28 +457,52 @@ bool VIO_estimator::calculate_reprojection_error(GRBQuadExpr &obj,
         // 前后两帧归一化后的特征点坐标之差值
         Eigen::Vector3d delta_feature = img_queue[i + 1][id].head<3>() / img_queue[i + 1][id].head<3>().norm() -
                                         img_queue[i][id].head<3>() / img_queue[i][id].head<3>().norm();
-        sum_delta_feature += delta_feature;
+        // sum_delta_feature += delta_feature; // debug
         if (img_queue[i][id][7]) // 根据which_cam区分相机
         {
           pthread_mutex_lock(&mutex);
           // 变换后的特征点坐标与后帧对应特征点之间的重投影误差
-          obj += robust_kernel(delta_feature[0], position[P_id], scale[2 * i]) +
-                 robust_kernel(delta_feature[1], position[P_id + 1], scale[2 * i]) +
-                 robust_kernel(delta_feature[2], position[P_id + 2], scale[2 * i]);
+          obj += robust_kernel(delta_feature[0], position[P_id], scale[S_id]) +
+                 robust_kernel(delta_feature[1], position[P_id + 1], scale[S_id]) +
+                 robust_kernel(delta_feature[2], position[P_id + 2], scale[S_id]);
           pthread_mutex_unlock(&mutex);
+
+          velocity_x_1 += img_queue[i][id][5];
+          velocity_y_1 += img_queue[i][id][6];
+          cam1_counter++;
         }
         else
         {
           pthread_mutex_lock(&mutex);
           // 变换后的特征点坐标与后帧对应特征点之间的重投影误差
-          obj += robust_kernel(delta_feature[0], position[P_id], scale[2 * i + 1]) +
-                 robust_kernel(delta_feature[1], position[P_id + 1], scale[2 * i + 1]) +
-                 robust_kernel(delta_feature[2], position[P_id + 2], scale[2 * i + 1]);
+          obj += (robust_kernel(delta_feature[0], position[P_id], scale[S_id + 1]) +
+                  robust_kernel(delta_feature[1], position[P_id + 1], scale[S_id + 1]) +
+                  robust_kernel(delta_feature[2], position[P_id + 2], scale[S_id + 1])) *
+                 FEATURE_WEIGHT;
           pthread_mutex_unlock(&mutex);
+
+          velocity_x_2 += img_queue[i][id][5];
+          velocity_y_2 += img_queue[i][id][6];
+          cam2_counter++;
         }
       }
     }
-    cout << "sum_delta_feature = " << sum_delta_feature[0] << ", " << sum_delta_feature[1] << ", " << sum_delta_feature[2] << endl;
+#ifdef DEBUG_estimator
+    // cout << "sum_delta_feature = " << sum_delta_feature[0] << ", " << sum_delta_feature[1] << ", " << sum_delta_feature[2] << endl;             // debug
+    cout << "velocity cam1 = " << velocity_x_1 << ", " << velocity_y_1 << ", velocity cam2 = " << velocity_x_2 << ", " << velocity_y_2 << endl; // debug
+#endif
+    // 光流速度合成，坐标系变换
+    // velocity_x = scale[2 * i] * velocity_x_1 / cam1_counter;
+    // velocity_y = (scale[2 * i] * velocity_y_1 / cam1_counter + scale[2 * i + 1] * velocity_y_2 / cam2_counter) / 2;
+    // velocity_z = scale[2 * i + 1] * velocity_x_2 / cam2_counter;
+
+    obj += ((10 * scale[2 * i + 1] * velocity_x_2 / cam2_counter + velocity[P_id]) *
+                (10 * scale[2 * i + 1] * velocity_x_2 / cam2_counter + velocity[P_id]) +
+            (-10 * scale[2 * i] * velocity_x_1 / cam1_counter + velocity[P_id + 1]) *
+                (-10 * scale[2 * i] * velocity_x_1 / cam1_counter + velocity[P_id + 1]) +
+            (-5 * (scale[2 * i] * velocity_y_1 / cam1_counter + scale[2 * i + 1] * velocity_y_2 / cam2_counter) + velocity[P_id + 2]) *
+                (-5 * (scale[2 * i] * velocity_y_1 / cam1_counter + scale[2 * i + 1] * velocity_y_2 / cam2_counter) + velocity[P_id + 2])) *
+           OPTICAL_WEIGHT;
   }
   return 1;
 }
