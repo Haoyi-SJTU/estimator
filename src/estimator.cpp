@@ -21,7 +21,7 @@
 // 类声明
 #include "estimator.hpp"
 
-// #include <opencv2/opencv.hpp> //debug:优化结束后waitkey用
+#include "debug_tool.hpp"
 
 using namespace message_filters;
 using namespace std;
@@ -56,7 +56,7 @@ void VIO_estimator::acc_callback(const geometry_msgs::Vector3Stamped::ConstPtr &
     else
     {
       pre_integrate(); // 预积分
-
+      // publish_imu_result();
       acc_0.first = acc_now.first; // 更新acc
       acc_0.second = acc_now.second;
       gyr_0.first = gyr_now.first; // 更新gyr
@@ -119,14 +119,14 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
     if (!add_keyframe(image)) // 图像关键帧进窗img_queue,并获取滑动窗内所有特征点编号的交集
       return;                 // 如果符合关键帧条件，则存入滑动窗，否则退出
     // 读预积分结果、清空预积分
-    pthread_mutex_lock(&mutex);   // 加锁 取出预积分结果
-    Ps_queue.push_back(Ps_now);   // 位置预积分进窗
-    Vs_queue.push_back(Vs_now);   // 速度预积分进窗
-    Rs_queue.push_back(Rs_now);   // 转角旋转矩阵预积分进窗
+    pthread_mutex_lock(&mutex); // 加锁 取出预积分结果
+    Ps_queue.push_back(Ps_now); // 位置预积分进窗
+    Vs_queue.push_back(Vs_now); // 速度预积分进窗
+    // Rs_queue.push_back(Rs_now);   // 转角旋转矩阵预积分进窗
     Qs_queue.push_back(Qs_now);   // 转角四元数预积分进窗
     pthread_mutex_unlock(&mutex); // 解锁 结束取预积分结果
     Ps_now.setZero();             // 新一轮预积分，位移置零，速度不变。但是VINS里直接把速度置零了
-    Rs_now.setZero();
+    // Rs_now.setZero();
     Qs_now.setIdentity();
   }
   else // 滑动窗已满
@@ -135,20 +135,20 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
     if (!add_keyframe(image)) // 图像关键帧进窗img_queue,并获取滑动窗内所有特征点编号的交集
       return;                 // 如果符合关键帧条件，则存入滑动窗，否则退出
     // 读预积分结果、清空预积分
-    pthread_mutex_lock(&mutex);   // 加锁 取出预积分结果
-    Ps_queue.push_back(Ps_now);   // 位置预积分进窗
-    Vs_queue.push_back(Vs_now);   // 速度预积分进窗
-    Rs_queue.push_back(Rs_now);   // 转角旋转矩阵预积分进窗
+    pthread_mutex_lock(&mutex); // 加锁 取出预积分结果
+    Ps_queue.push_back(Ps_now); // 位置预积分进窗
+    Vs_queue.push_back(Vs_now); // 速度预积分进窗
+    // Rs_queue.push_back(Rs_now);   // 转角旋转矩阵预积分进窗
     Qs_queue.push_back(Qs_now);   // 转角四元数预积分进窗
     pthread_mutex_unlock(&mutex); // 解锁 结束取预积分结果
     Ps_now.setZero();             // 新一轮预积分，位移置零，速度不变。但是VINS里直接把速度置零了
-    Rs_now.setZero();
+    // Rs_now.setZero();
     Qs_now.setIdentity();
     // 滑动窗已满 需要清理掉最早的数据 对应VINS slidWindow()
     img_queue.pop_front();
     Ps_queue.pop_front();
     Vs_queue.pop_front();
-    Rs_queue.pop_front();
+    // Rs_queue.pop_front();
     Qs_queue.pop_front();
   }
 
@@ -181,8 +181,9 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
 
       // 目标函数
       calculate_reprojection_error(obj, position, velocity, quaternion, scale);
-      // calculate_preintegrate_error(obj, position, velocity, quaternion);
+      calculate_preintegrate_error(obj, position, velocity, quaternion);
       calculate_scale_factor_error(obj, scale); // 优化器目标函数: 尺度因子误差
+
       try
       {
         model.setObjective(obj);
@@ -238,13 +239,13 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
             break;
           case GRB_OPTIMAL:
             object_function_value = model.get(GRB_DoubleAttr_ObjVal);
-            if (object_function_value <= 0 || object_function_value >= 1e10) // 优化错误，代价函数为0
+            if (object_function_value <= 0 || object_function_value >= 1e5) // 优化错误，代价函数为0
             {
 #ifdef DEBUG_estimator
               ROS_WARN("ignore 1 error result");
               model.write("/home/yuanzhi/catkin_ws/src/estimator/tmp/bad_model.prm"); // 配置参数
               model.write("/home/yuanzhi/catkin_ws/src/estimator/tmp/bad_model.mps"); // 模型
-              publish_result(1, position, velocity, quaternion, scale);               // 1: 发布VIO优化结果
+              print_result_debug(WINDOW_SIZE, position, velocity, quaternion, scale); // debug 打印优化结果
 #endif
               // model.set(GRB_IntParam_Presolve, 0);
               initial_optimization_variables(position, velocity, quaternion, scale);
@@ -254,19 +255,23 @@ void VIO_estimator::feature_callback_cam1(const sensor_msgs::PointCloudConstPtr 
             else
             {
 #ifdef DEBUG_estimator
+              print_result_debug(WINDOW_SIZE, position, velocity, quaternion, scale); // debug 打印优化结果
               error_optimize++;
               cout << "目标函数: " << object_function_value << endl; // 最优解对应的目标函数值
 #endif
               re_switch = 0;
-              publish_result(1, position, velocity, quaternion, scale); // 1: 发布VIO优化结果
+              local_to_global(position, velocity, quaternion, scale);
+              publish_vio_result(); // 发布VIO优化结果
             }
             break;
           case GRB_TIME_LIMIT:
-            ROS_WARN("time limit");
             re_switch = 0;
+#ifdef DEBUG_estimator
+            ROS_WARN("time limit");
             object_function_value = model.get(GRB_DoubleAttr_ObjVal);
-            cout << "目标函数: " << object_function_value << endl;    // 最优解对应的目标函数值
-            publish_result(1, position, velocity, quaternion, scale); // 1: 发布VIO优化结果
+            cout << "目标函数: " << object_function_value << endl;                  // 最优解对应的目标函数值
+            print_result_debug(WINDOW_SIZE, position, velocity, quaternion, scale); // debug 打印优化结果
+#endif
             break;
           default:
             cout << "不寻常的错误码 = " << optimstatus << endl;
@@ -326,7 +331,8 @@ bool VIO_estimator::resize_variables(GRBModel &model,
 
 // 为优化变量设置初值
 bool VIO_estimator::initial_optimization_variables(
-    std::vector<GRBVar> &position, std::vector<GRBVar> &velocity, std::vector<GRBVar> &quaternion, std::vector<GRBVar> &scale)
+    std::vector<GRBVar> &position, std::vector<GRBVar> &velocity,
+    std::vector<GRBVar> &quaternion, std::vector<GRBVar> &scale)
 {
   // 向尺度因子数组末尾（最近的帧）填入scale factor初值
   scale[2 * WINDOW_SIZE - 2].set(GRB_DoubleAttr_Obj, scale_factor_1);
@@ -547,78 +553,74 @@ bool VIO_estimator::find_Active_feature_id()
   return 1;
 }
 
-// 测试用 发布点云消息
-// void publishPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr &pointCloud, ros::NodeHandle &nh, ros::Publisher &pub)
-// {
-//   sensor_msgs::PointCloud2 cloudMsg;
-//   pcl::toROSMsg(*pointCloud, cloudMsg);
-//   cloudMsg.header.stamp = ros::Time::now();
-//   cloudMsg.header.frame_id = "world"; // 设置消息的坐标系
-//   pub.publish(cloudMsg);
-// }
+// 将优化器结果的local位移累加到global的相对于tag系下的位姿上
+inline void VIO_estimator::local_to_global(std::vector<GRBVar> &position, std::vector<GRBVar> &velocity,
+                                           std::vector<GRBVar> &quaternion, std::vector<GRBVar> &scale)
+{
+  P_now[0] += position[3 * WINDOW_SIZE - 3].get(GRB_DoubleAttr_X) / 10;
+  P_now[1] += position[3 * WINDOW_SIZE - 2].get(GRB_DoubleAttr_X) / 10;
+  P_now[2] += position[3 * WINDOW_SIZE - 1].get(GRB_DoubleAttr_X) / 10;
+
+  // 顺序 w x y z
+  Eigen::Quaterniond Q_local(quaternion[3 * WINDOW_SIZE - 4].get(GRB_DoubleAttr_X), quaternion[3 * WINDOW_SIZE - 3].get(GRB_DoubleAttr_X),
+                             quaternion[3 * WINDOW_SIZE - 2].get(GRB_DoubleAttr_X), quaternion[3 * WINDOW_SIZE - 1].get(GRB_DoubleAttr_X));
+  Q_now = Q_now * Q_local;
+  R_now = Q_now.toRotationMatrix();
+}
 
 // 发布VIO优化结果
-// publish_mode: 0 IMU积分结果; 1 VIO优化结果; 2 tag结果
-void VIO_estimator::publish_result(int publish_mode,
-                                   std::vector<GRBVar> &position, std::vector<GRBVar> &velocity,
-                                   std::vector<GRBVar> &quaternion, std::vector<GRBVar> &scale)
+inline void VIO_estimator::publish_vio_result()
 {
-  estimator::result result_Msg;
+  pthread_mutex_lock(&mutex); // 发布VIO优化结果
+  // VIO优化结果
+  geometry_msgs::TransformStamped result_Msg;
   result_Msg.header.stamp = ros::Time::now();
   result_Msg.header.frame_id = "world"; // 设置消息的坐标系
+  result_Msg.child_frame_id = "sensor_link";
+  // result_Msg.transform.translation.x = P_now[0];
+  // result_Msg.transform.translation.y = P_now[1];
+  // result_Msg.transform.translation.z = P_now[2];
+  result_Msg.transform.rotation.x = Q_now.x();
+  result_Msg.transform.rotation.y = Q_now.y();
+  result_Msg.transform.rotation.z = Q_now.z();
+  result_Msg.transform.rotation.w = Q_now.w();
+  // result_Msg.transform.rotation.x = Q_VIOresult_WEIGHT * Q_now.x() + Q_IMUresult_WEIGHT * gyr_now.second.x();
+  // result_Msg.transform.rotation.y = Q_VIOresult_WEIGHT * Q_now.y() + Q_IMUresult_WEIGHT * gyr_now.second.y();
+  // result_Msg.transform.rotation.z = Q_VIOresult_WEIGHT * Q_now.z() + Q_IMUresult_WEIGHT * gyr_now.second.z();
+  // result_Msg.transform.rotation.w = Q_VIOresult_WEIGHT * Q_now.w() + Q_IMUresult_WEIGHT * gyr_now.second.w();
+  result_Msg.transform.translation.x = P_VIOresult_WEIGHT * P_now[0] + P_IMUresult_WEIGHT * Ps_all[0];
+  result_Msg.transform.translation.y = P_VIOresult_WEIGHT * P_now[1] + P_IMUresult_WEIGHT * Ps_all[1];
+  result_Msg.transform.translation.z = P_VIOresult_WEIGHT * P_now[2] + P_IMUresult_WEIGHT * Ps_all[2];
 
-  switch (publish_mode)
+  ESTIMATOR_PUB = 1;
+  broadcaster.sendTransform(result_Msg);
+  ESTIMATOR_PUB = 0;
+  pthread_mutex_unlock(&mutex);
+}
+
+// 发布IMU结果
+inline void VIO_estimator::publish_imu_result()
+{
+  if (ESTIMATOR_PUB) // IMU结果发布的优先级小于VIO结果发布
+    return;
+  else
   {
-  case 1: // VIO优化结果
-#ifdef DEBUG_estimator
-    for (int i = 0; i < WINDOW_SIZE; i++)
-    {
-      double p_x = position[3 * i].get(GRB_DoubleAttr_X) / 10;
-      double p_y = position[3 * i + 1].get(GRB_DoubleAttr_X) / 10;
-      double p_z = position[3 * i + 2].get(GRB_DoubleAttr_X) / 10;
-      double v_x = velocity[3 * i].get(GRB_DoubleAttr_X) / 10;
-      double v_y = velocity[3 * i + 1].get(GRB_DoubleAttr_X) / 10;
-      double v_z = velocity[3 * i + 2].get(GRB_DoubleAttr_X) / 10;
-      double q_w = quaternion[4 * i].get(GRB_DoubleAttr_X);
-      double q_x = quaternion[4 * i + 1].get(GRB_DoubleAttr_X);
-      double q_y = quaternion[4 * i + 2].get(GRB_DoubleAttr_X);
-      double q_z = quaternion[4 * i + 3].get(GRB_DoubleAttr_X);
-      double scale_1 = scale[2 * i].get(GRB_DoubleAttr_X);
-      double scale_2 = scale[2 * i + 1].get(GRB_DoubleAttr_X);
-      std::cout << "优化后 p=(" << p_x << ", " << p_y << ", " << p_z << "), v=("
-                << v_x << ", " << v_y << ", " << v_z << "), q=("
-                << q_w << ", " << q_x << ", " << q_y << ", " << q_z << "), scale=("
-                << scale_1 << ", " << scale_2 << ")" << std::endl;
-    }
-#endif
-    result_Msg.position_now.x = position[3 * WINDOW_SIZE - 3].get(GRB_DoubleAttr_X) / 10;
-    result_Msg.position_now.y = position[3 * WINDOW_SIZE - 2].get(GRB_DoubleAttr_X) / 10;
-    result_Msg.position_now.z = position[3 * WINDOW_SIZE - 1].get(GRB_DoubleAttr_X) / 10;
-    result_Msg.velocity_now.x = velocity[3 * WINDOW_SIZE - 3].get(GRB_DoubleAttr_X) / 10;
-    result_Msg.velocity_now.y = velocity[3 * WINDOW_SIZE - 2].get(GRB_DoubleAttr_X) / 10;
-    result_Msg.velocity_now.z = velocity[3 * WINDOW_SIZE - 1].get(GRB_DoubleAttr_X) / 10;
-    result_Msg.orientation_now.x = quaternion[3 * WINDOW_SIZE - 4].get(GRB_DoubleAttr_X);
-    result_Msg.orientation_now.y = quaternion[3 * WINDOW_SIZE - 3].get(GRB_DoubleAttr_X);
-    result_Msg.orientation_now.z = quaternion[3 * WINDOW_SIZE - 2].get(GRB_DoubleAttr_X);
-    result_Msg.orientation_now.w = quaternion[3 * WINDOW_SIZE - 1].get(GRB_DoubleAttr_X);
+    pthread_mutex_lock(&mutex);
+    geometry_msgs::TransformStamped result_Msg;
+    result_Msg.header.stamp = ros::Time::now();
+    result_Msg.header.frame_id = "world"; // 设置消息的坐标系
+    result_Msg.child_frame_id = "sensor_link";
+    result_Msg.transform.translation.x = Ps_all[0];
+    result_Msg.transform.translation.y = Ps_all[1];
+    result_Msg.transform.translation.z = Ps_all[2];
+    result_Msg.transform.rotation.x = gyr_now.second.x();
+    result_Msg.transform.rotation.y = gyr_now.second.y();
+    result_Msg.transform.rotation.z = gyr_now.second.z();
+    result_Msg.transform.rotation.w = gyr_now.second.w();
 
-    break;
-  case 2: // tag结果
-    result_Msg.position_now.x = P_now[0];
-    result_Msg.position_now.y = P_now[1];
-    result_Msg.position_now.z = P_now[2];
-    result_Msg.velocity_now.x = Vs_now[0];
-    result_Msg.velocity_now.y = Vs_now[1];
-    result_Msg.velocity_now.z = Vs_now[2];
-    result_Msg.orientation_now.x = Q_now.x();
-    result_Msg.orientation_now.y = Q_now.y();
-    result_Msg.orientation_now.z = Q_now.z();
-    result_Msg.orientation_now.w = Q_now.w();
-    break;
-  default: // IMU积分结果
-    break;
+    broadcaster.sendTransform(result_Msg);
+    pthread_mutex_unlock(&mutex);
   }
-  result_pub.publish(result_Msg);
 }
 
 // 判断特征点的图像坐标是否很靠近已知深度值的像素点
@@ -672,7 +674,6 @@ bool VIO_estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double,
     pcl::PointCloud<pcl::PointXYZ>::Ptr transformedCloudB(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::transformPointCloud(*pointCloud, *transformedCloudB, T_cam2world);
     *pointCloud_world += *transformedCloudB; // 世界系（tag系）下的点云
-    // *pointCloud_world += *pointCloud; // cam1系下的点云
     // publishPointCloud(pointCloud, nh_tag, pointcloud_pub);
 
     // std::cout << "点云的点数是 pointCloud " << pointCloud->size() << std::endl;
@@ -687,6 +688,8 @@ bool VIO_estimator::pointcloud_initial(const std::map<int, Eigen::Matrix<double,
 // 计算传感器相对于tag系(世界系)的变换阵
 void VIO_estimator::apriltag_callback_cam1(const apriltag_ros::AprilTagDetectionArray::ConstPtr &msg)
 {
+  if (!ESTIMATOR_FLAG)
+    return;
   if (msg->detections.empty())
     return;
   const std_msgs::Header &Header = msg->header;
@@ -708,12 +711,15 @@ void VIO_estimator::apriltag_callback_cam1(const apriltag_ros::AprilTagDetection
   T_cam_tag.block<3, 1>(0, 3) = t_cam_tag;
   T_cam_tag.block<3, 3>(0, 0) = q_cam_tag.toRotationMatrix();
   // 计算 T_tag_imu
+  pthread_mutex_lock(&mutex);
   T_now = T_imu_cam.inverse() * T_cam_tag.inverse(); //  imu系在tag系下的齐次变换矩阵
   P_now = T_now.block<3, 1>(0, 3);                   //  imu系在tag系下的平移向量
   R_now = T_now.block<3, 3>(0, 0).transpose();       //  imu系在tag系下的旋转矩阵
   Q_now = Quaterniond(R_now);                        //  imu系在tag系下的四元数
-
-  // publish_result(2, position, velocity, quaternion, scale);
+  pthread_mutex_unlock(&mutex);
+  // pthread_mutex_lock(&mutex);
+  publish_vio_result();
+  // pthread_mutex_unlock(&mutex);
 }
 
 void VIO_estimator::tag_center_callback(const geometry_msgs::PointStamped::ConstPtr &msg)
@@ -757,13 +763,14 @@ inline void VIO_estimator::pre_integrate()
 
   // gyr_0与gyr_now之间的转角差，转换为旋转矩阵存入Rs_now，作为预积分结果存入滑动窗
   Qs_now = gyr_now.second * gyr_0.second.inverse();
-  Rs_now = Qs_now.toRotationMatrix();
+  // Rs_now = Qs_now.toRotationMatrix();
   // Vector3d un_acc_1 = Rs[j] * (linear_acceleration - Bas[img_count]) - g;
   // Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1); // 均值滤波：上一次的加速度和当前值分别去偏差去重力后求平均
 
   // 加锁 更新预积分结果
   pthread_mutex_lock(&mutex);
   Ps_now += Vs_now * dt + 0.5 * dt * dt * acc_0.second;
+  Ps_all += Vs_now * dt + 0.5 * dt * dt * acc_0.second;
   Vs_now += dt * acc_now.second;
   pthread_mutex_unlock(&mutex);
 }
@@ -816,7 +823,7 @@ void VIO_estimator::add_Variables(GRBModel &model,
   // 添加尺度因子变量
   for (int j = 0; j < 2 * WINDOW_SIZE; j++)
   {
-    scale[j] = model.addVar(1, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
+    scale[j] = model.addVar(1, 1e3, 0.0, GRB_CONTINUOUS);
   }
 }
 
@@ -860,7 +867,7 @@ void VIO_estimator::add_Constraints(GRBModel &model,
 
 VIO_estimator::VIO_estimator() //: env(), model(env)
 {
-  mutex = PTHREAD_MUTEX_INITIALIZER; // 多线程互斥锁 初始化
+  mutex = PTHREAD_MUTEX_INITIALIZER; // 多result线程互斥锁 初始化
   imu_init = 0;                      // imu初始化并更新时间戳起点
   WINDOW_FULL_FLAG = 0;              // 滑动窗不满
   ESTIMATOR_FLAG = 0;                // 0:初始化阶段; 1:优化阶段
@@ -900,12 +907,13 @@ VIO_estimator::VIO_estimator() //: env(), model(env)
 
   ros::Subscriber img_listener_1 = nh_img.subscribe("pointcloud_talker", 1, &VIO_estimator::feature_callback_cam1, this); // 相机 图像特征点 回调
 
-  ros::Subscriber sub = nh_tag.subscribe("/laser_distance_talker", 2, &VIO_estimator::laser_callback, this);                     // laser 深度差值 回调
-  ros::Subscriber tag_listener_1 = nh_tag.subscribe("/tag_detections", 1, &VIO_estimator::apriltag_callback_cam1, this);         // 相机1 图像apriltag坐标 回调
-  ros::Subscriber tag_center_listener_1 = nh_tag.subscribe("/tag_img_coordinate", 1, &VIO_estimator::tag_center_callback, this); // 相机1 图像apriltag坐标 回调
+  ros::Subscriber sub = nh_tag.subscribe("/laser_distance_talker", 2, &VIO_estimator::laser_callback, this);             // laser 深度差值 回调
+  ros::Subscriber tag_listener_1 = nh_tag.subscribe("/tag_detections", 1, &VIO_estimator::apriltag_callback_cam1, this); // 相机1 图像apriltag坐标 回调
+  // ros::Subscriber tag_center_listener_1 = nh_tag.subscribe("/tag_img_coordinate", 1, &VIO_estimator::tag_center_callback, this); // 相机1 图像apriltag坐标 回调
 
   pointcloud_pub = nh_tag.advertise<sensor_msgs::PointCloud2>("transformed_cloud", 1);
-  result_pub = nh_tag.advertise<estimator::result>("vio_result", 1);
+  // result_pub = nh_tag.advertise<estimator::result>("vio_result", 1);
+  // result_pub = nh_tag.advertise<geometry_msgs::TransformStamped>("vio_result", 1);
 
   // 每个队列内再单独设置多线程
   std::thread spinner_thread_img([&queue_img]()
