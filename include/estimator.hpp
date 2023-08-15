@@ -11,7 +11,11 @@
 // 发布结果消息
 #include "geometry_msgs/Vector3.h"
 #include "geometry_msgs/Quaternion.h"
-#include "estimator/result.h"
+#include "geometry_msgs/TransformStamped.h"
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2_ros/transform_broadcaster.h>
+// #include "estimator/result.h"//自定义消息
 
 #include <eigen3/Eigen/Dense>
 #include <deque>
@@ -29,10 +33,13 @@
 
 #define DEBUG_estimator // 优化器调试
 
+// #define EIGEN_USE_MKL_ALL //开启mkl优化：在使用Intel处理器并且已经安装好mkl库的情况下，可通过宏开启Eigen3的mkl优化
+// #define EIGEN_NO_DEBUG //关闭Debug模式：在确保程序无误的情况下，关闭Debug断言，可以提升程序效率
+
 const unsigned int WINDOW_SIZE = 10;   // 滑动窗长度
 const float MIN_delta_depth_1 = 200;   // 深度预积分阈值
 const float MIN_delta_depth_2 = 200;   // 深度预积分阈值
-const float MIN_Ps_for_1_image = 0.05; // 能让图像成为关键帧的最小IMU积分阈值 0.05 m
+const float MIN_Ps_for_1_image = 0.02; // 能让图像成为关键帧的最小IMU积分阈值 0.02 m
 const double Max_Ps = 0.1;			   // 一个窗内的最大位移 单位m
 const double Max_Delta_Ps = 0.01;	   // 相邻两个窗的最大位移差值 单位m
 const double Max_Vs = 3;			   // 每帧的最大速度 单位m/s
@@ -40,6 +47,16 @@ const double Max_Delta_Vs = 1;		   // 相邻两帧的最大速度差值 单位m/
 const double MIN_Active_Feature = 4;   // 活跃特征点个数的最小阈值，小于4则不进行重投影误差计算
 const double DT_IMG = 0.050;		   // 相邻两帧的时间差，根据图像消息发布频率7Hz估计
 const double TOLERANCE = 0.020;		   // 优化器位移-速度约束的上下公差
+const double P_WEIGHT = 1;			   // 优化器 IMU-位移误差项 权重
+const double V_WEIGHT = 1.5;		   // 优化器 IMU-速度误差项 权重
+const double Q_WEIGHT = 100;		   // 优化器 IMU-转角四元数误差项 权重
+const double SCALE_WEIGHT = 0.01;	   // 优化器 相机-尺度因子误差项 权重
+const double FEATURE_WEIGHT = 100;	   // 优化器 相机-特征点误差项 权重
+const double OPTICAL_WEIGHT = 0.05;	   // 优化器 相机-光流速度误差项 权重
+const float Q_VIOresult_WEIGHT = 0.2; // TF发布的Q中，来自VIO优化结果的权重
+const float Q_IMUresult_WEIGHT = 0.8; // TF发布的Q中，来自IMU结果的权重
+const float P_VIOresult_WEIGHT = 0.4; // TF发布的P中，来自VIO优化结果的权重
+const float P_IMUresult_WEIGHT = 0.6; // TF发布的P中，来自IMU结果的权重
 
 class VIO_estimator
 {
@@ -48,6 +65,7 @@ private:
 	ros::Timer result_pub_timer;				   // 定时器
 	ros::Publisher result_pub;					   // 结果发布
 	ros::Publisher pointcloud_pub;				   // 结果点云发布
+	tf2_ros::TransformBroadcaster broadcaster;	   // 结果TF 发布
 	ros::NodeHandle nh_imu;						   // IMU消息相应句柄
 	ros::NodeHandle nh_gyc;						   // IMU消息相应句柄
 	ros::NodeHandle nh_img;						   // 图像消息响应句柄
@@ -56,6 +74,7 @@ private:
 	bool imu_init;								   // 首次记录IMU
 	bool WINDOW_FULL_FLAG;						   // 滑动窗是否满了
 	bool ESTIMATOR_FLAG;						   // 0:初始化阶段; 1:优化阶段
+	bool ESTIMATOR_PUB;							   // 正在发布优化器/tag数据
 	long int imu_t0;							   // IMU时间戳初始化
 	double dt;									   // acc时间间隔
 	std::pair<double, Eigen::Vector3d> acc_0;	   // IMU 上一次 时间戳+加速度
@@ -67,8 +86,9 @@ private:
 
 	Eigen::Vector3d Ps_now; // IMU预积分 当前三方向位置
 	Eigen::Vector3d Vs_now; // IMU预积分 当前三方向速度
-	Eigen::Matrix3d Rs_now; // IMU预积分 当前三方向转角
+	// Eigen::Matrix3d Rs_now; // IMU预积分 当前三方向转角
 	Eigen::Quaterniond Qs_now;
+	Eigen::Vector3d Ps_all;								  // IMU预积分 累计三方向位置
 	pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud_world; // 世界坐标系下的点云
 
 	// tag产生的数据 相对于tag的坐标
@@ -104,6 +124,7 @@ private:
 	bool initial_optimization_variables(std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);			  // 为优化变量设置初值
 	bool calculate_reprojection_error(GRBQuadExpr &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &); // cam残差: 将重投影误差加入目标函数
 	bool calculate_preintegrate_error(GRBQuadExpr &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);						  // 预积分误差: 最小化位移、速度、转角的估计值与IMU预积分之间的差值
+	bool calculate_scale_factor_error(GRBQuadExpr &, std::vector<GRBVar> &);																	  // 优化器目标函数: 尺度因子误差
 	inline GRBQuadExpr robust_kernel(const double, GRBVar &, GRBVar &);																			  // 鲁棒核函数 用于加权cam残差
 	bool resize_variables(GRBModel &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);				  // 优化失败后收紧变量范围再次优化
 
@@ -121,8 +142,10 @@ private:
 	void apriltag_callback_cam1(const apriltag_ros::AprilTagDetectionArray::ConstPtr &msg); // 相机1 图像apriltag坐标 回调
 	void tag_center_callback(const geometry_msgs::PointStamped::ConstPtr &msg);				// 接收tag中心的图像坐标
 
-	void laser_callback(const geometry_msgs::PointStamped::ConstPtr &msg); // laser 深度差值 回调
-	void publish_result(int, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &);
+	void laser_callback(const geometry_msgs::PointStamped::ConstPtr &msg);													 // laser 深度差值 回调
+	inline void local_to_global(std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &); // 将优化器结果的local位移累加到global的相对于tag系下的位姿上
+	inline void publish_vio_result();																						 // 发布VIO结果
+	inline void publish_imu_result();																						 // 发布imu结果
 
 public:
 	VIO_estimator();
