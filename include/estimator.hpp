@@ -53,10 +53,8 @@ const double Q_WEIGHT = 100;		   // 优化器 IMU-转角四元数误差项 权�
 const double SCALE_WEIGHT = 0.01;	   // 优化器 相机-尺度因子误差项 权重
 const double FEATURE_WEIGHT = 100;	   // 优化器 相机-特征点误差项 权重
 const double OPTICAL_WEIGHT = 0.05;	   // 优化器 相机-光流速度误差项 权重
-const float Q_VIOresult_WEIGHT = 0.2; // TF发布的Q中，来自VIO优化结果的权重
-const float Q_IMUresult_WEIGHT = 0.8; // TF发布的Q中，来自IMU结果的权重
-const float P_VIOresult_WEIGHT = 0.4; // TF发布的P中，来自VIO优化结果的权重
-const float P_IMUresult_WEIGHT = 0.6; // TF发布的P中，来自IMU结果的权重
+const float P_VIOresult_WEIGHT = 0.5;  // TF发布的P中，来自VIO优化结果的权重
+const float P_IMUresult_WEIGHT = 0.5;  // TF发布的P中，来自IMU结果的权重
 
 class VIO_estimator
 {
@@ -75,6 +73,8 @@ private:
 	bool WINDOW_FULL_FLAG;						   // 滑动窗是否满了
 	bool ESTIMATOR_FLAG;						   // 0:初始化阶段; 1:优化阶段
 	bool ESTIMATOR_PUB;							   // 正在发布优化器/tag数据
+	bool PUB_VIO_PLAG;							   // 产生数据，可以发布
+	bool GOOD_VIO_PLAG;							   // 好数据，可以加在发布结果里
 	long int imu_t0;							   // IMU时间戳初始化
 	double dt;									   // acc时间间隔
 	std::pair<double, Eigen::Vector3d> acc_0;	   // IMU 上一次 时间戳+加速度
@@ -83,13 +83,16 @@ private:
 	std::pair<double, Eigen::Quaterniond> gyr_now; // gyr 取当前加速度的同时保存下来当前的 转角 (是转角不是角速度)
 	std::pair<double, Eigen::Quaterniond> gyr;	   // 时刻更新的 时间戳+转角
 	float tag_center_u, tag_center_v;			   // tag中心点的图像坐标
+	float delta_x_world;						   // 机器人基坐标系下的运动增量
+	float delta_y_world;
+	float delta_z_world;
 
 	Eigen::Vector3d Ps_now; // IMU预积分 当前三方向位置
 	Eigen::Vector3d Vs_now; // IMU预积分 当前三方向速度
 	// Eigen::Matrix3d Rs_now; // IMU预积分 当前三方向转角
 	Eigen::Quaterniond Qs_now;
-	Eigen::Vector3d Ps_all;								  // IMU预积分 累计三方向位置
 	pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud_world; // 世界坐标系下的点云
+	Eigen::Vector3f ideal_trace;						  // 理想轨迹的坐标(base_link)
 
 	// tag产生的数据 相对于tag的坐标
 	Eigen::Matrix4d T_imu_cam; // cam1相对于imu坐标系的变换矩阵，单位m 外参   注意此参数来自于标定！！！！！！！！！！！！！！
@@ -109,6 +112,7 @@ private:
 	std::vector<int> Active_feature_id; // 动态更新在整个滑动窗内都活跃的特征点ID
 	float scale_factor_1;				// 最新尺度因子初值 cam1
 	float scale_factor_2;				// 最新尺度因子初值 cam2
+	unsigned int static_thread;			// 用来判定图像是否静止
 
 	// 优化器变量
 	// GRBEnv env;						// 优化环境
@@ -130,7 +134,7 @@ private:
 
 	inline void pre_integrate();																				  // 预积分
 	bool refresh(Eigen::Vector3d Ps = Eigen::Vector3d::Zero(), Eigen::Matrix3d Rs = Eigen::Matrix3d::Identity()); // 重置估计器
-	bool pointcloud_initial(const std::map<int, Eigen::Matrix<double, 8, 1>> &, double, double, double, double);  // 初始化3D点云
+	// bool pointcloud_initial(const std::map<int, Eigen::Matrix<double, 8, 1>> &, double, double, double, double);  // 初始化3D点云
 
 	bool filterImage(const std::map<int, Eigen::Matrix<double, 8, 1>> &, double, double, double, double, std::vector<int> &);
 	bool add_keyframe(std::map<int, Eigen::Matrix<double, 8, 1>> &); // 向滑动窗添加关键帧
@@ -141,11 +145,13 @@ private:
 	void feature_callback_cam1(const sensor_msgs::PointCloudConstPtr &feature_msg);			// 相机1  图像特征点 回调
 	void apriltag_callback_cam1(const apriltag_ros::AprilTagDetectionArray::ConstPtr &msg); // 相机1 图像apriltag坐标 回调
 	void tag_center_callback(const geometry_msgs::PointStamped::ConstPtr &msg);				// 接收tag中心的图像坐标
+	void ideal_trace_callack(const geometry_msgs::PointStamped::ConstPtr &);				// 更新最新ideal trace
 
 	void laser_callback(const geometry_msgs::PointStamped::ConstPtr &msg);													 // laser 深度差值 回调
 	inline void local_to_global(std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &, std::vector<GRBVar> &); // 将优化器结果的local位移累加到global的相对于tag系下的位姿上
 	inline void publish_vio_result();																						 // 发布VIO结果
-	inline void publish_imu_result();																						 // 发布imu结果
+
+	// inline void publish_imu_result();	// 发布imu结果
 
 public:
 	VIO_estimator();
